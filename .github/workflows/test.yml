@@ -7,12 +7,6 @@ on:
         description: 'Your connecting device Tailscale IPv4 address (100.x.y.z)'
         required: true
         type: string
-      duration_minutes:
-        description: 'RDP test session duration in minutes'
-        required: true
-        default: '60'
-        type: choice
-        options: ['30', '60', '120', '180', '300']
 
 permissions:
   contents: read
@@ -24,16 +18,16 @@ concurrency:
 jobs:
   test:
     runs-on: windows-2025
-    timeout-minutes: 360
+    timeout-minutes: 270
     defaults:
       run:
         shell: pwsh
     env:
       RDP_CLIENT_IP: ${{ inputs.client_ip }}
-      SESSION_MINUTES: ${{ inputs.duration_minutes }}
 
     steps:
       - name: Validate settings
+        timeout-minutes: 1
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -54,11 +48,9 @@ jobs:
               $bytes[0] -ne 100 -or $bytes[1] -lt 64 -or $bytes[1] -gt 127) {
             throw 'client_ip must be your device Tailscale IPv4 address in 100.64.0.0/10.'
           }
-          if ($env:SESSION_MINUTES -notin @('30', '60', '120', '180', '300')) {
-            throw 'Unsupported session duration.'
-          }
 
       - name: Checkout project
+        timeout-minutes: 5
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
@@ -69,7 +61,7 @@ jobs:
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           hostname: gh-rdp-${{ github.run_id }}-${{ github.run_attempt }}
-          args: --accept-routes=false --shields-up=false
+          args: --shields-up=false
 
       - name: Configure RDP
         timeout-minutes: 5
@@ -77,6 +69,10 @@ jobs:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
+          # The action already supplies --accept-routes to `tailscale up`.
+          # Change this preference separately to avoid a duplicate flag.
+          & tailscale set --accept-routes=false
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot disable Tailscale route acceptance.' }
           $tailscaleIp = (& tailscale ip -4 | Select-Object -First 1).Trim()
           if ($LASTEXITCODE -ne 0 -or -not $tailscaleIp) {
             throw 'Cannot determine runner Tailscale IPv4 address.'
@@ -111,7 +107,10 @@ jobs:
           if (-not $ready) { throw 'RDP did not start listening on TCP 3389.' }
 
           $username = "$env:COMPUTERNAME\runneradmin"
-          $endsAt = [DateTimeOffset]::UtcNow.AddMinutes([int]$env:SESSION_MINUTES).ToString('u')
+          # Fixed four-hour deadline, starting when RDP is ready.
+          $endsAt = [DateTimeOffset]::UtcNow.AddHours(4)
+          "RDP_TEST_END_UTC=$($endsAt.ToString('o'))" |
+            Add-Content -Path $env:GITHUB_ENV -Encoding utf8
           $summary = @(
             '## Windows project test session',
             '',
@@ -120,18 +119,21 @@ jobs:
             '- Password: the value of your RDP_PASSWORD repository secret',
             "- Allowed client Tailscale IP: $env:RDP_CLIENT_IP",
             "- Project folder: $env:GITHUB_WORKSPACE",
-            "- Scheduled end (UTC): $endsAt",
+            '- Test duration: fixed at 4 hours (240 minutes)',
+            "- Scheduled end (UTC): $($endsAt.ToString('u'))",
             '- Use Cancel workflow when testing is finished.',
             '- Save needed files before the job ends; this VM is temporary.'
           )
           $summary | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
           Write-Host "RDP ready: $tailscaleIp`:3389 | User: $username"
 
-      - name: Keep project test session available
+      - name: Keep project test session available for 4 hours
         run: |
-          $endsAt = [DateTimeOffset]::UtcNow.AddMinutes([int]$env:SESSION_MINUTES)
-          while ([DateTimeOffset]::UtcNow -lt $endsAt) {
-            Start-Sleep -Seconds 30
+          $endsAt = [DateTimeOffset]::Parse($env:RDP_TEST_END_UTC)
+          while ($true) {
+            $remaining = ($endsAt - [DateTimeOffset]::UtcNow).TotalSeconds
+            if ($remaining -le 0) { break }
+            Start-Sleep -Seconds ([Math]::Min(30, [Math]::Ceiling($remaining)))
           }
 
       - name: Close RDP
