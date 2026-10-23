@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: windows-rdp-project-testing
@@ -17,8 +18,9 @@ concurrency:
 
 jobs:
   test:
+    name: Windows RDP test
     runs-on: windows-2025
-    timeout-minutes: 270
+    timeout-minutes: 330
     defaults:
       run:
         shell: pwsh
@@ -55,6 +57,91 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Create temporary Docker SSH identity
+        timeout-minutes: 1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sshDirectory = Join-Path $env:USERPROFILE '.ssh'
+          New-Item -ItemType Directory -Path $sshDirectory -Force | Out-Null
+          $keyPath = Join-Path $sshDirectory 'github-docker'
+          & node.exe -e "const r=require('node:child_process').spawnSync('ssh-keygen.exe',['-t','ed25519','-N','','-f',process.argv[1],'-q'],{stdio:'inherit'}); process.exit(r.status ?? 1);" $keyPath
+          if ($LASTEXITCODE -ne 0) { throw 'Docker SSH key generation failed.' }
+          & icacls.exe $keyPath /inheritance:r /grant:r "$($env:USERNAME):(R)"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot restrict Docker SSH private-key permissions.' }
+          # Only the public key is shared with the Linux job.
+          Copy-Item -LiteralPath "$keyPath.pub" -Destination (Join-Path $env:RUNNER_TEMP 'docker-client.pub')
+
+      - name: Share Docker SSH public key
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        timeout-minutes: 5
+        with:
+          name: docker-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/docker-client.pub
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Install Cloudflare Wrangler
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nodePath = (Get-Command node.exe -ErrorAction Stop).Source
+          $nodeDirectory = Split-Path -Parent $nodePath
+          & $nodePath -e "if (Number(process.versions.node.split('.')[0]) < 22) process.exit(1)"
+          if ($LASTEXITCODE -ne 0) { throw 'Wrangler requires Node.js 22 or later.' }
+
+          # Install outside the repository, with a persistent PATH for RDP sessions.
+          $wranglerDirectory = Join-Path $env:ProgramFiles 'CloudflareWrangler'
+          & npm.cmd install --global --prefix $wranglerDirectory wrangler@4.152.0 --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'Cloudflare Wrangler installation failed.' }
+
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          foreach ($directory in @($wranglerDirectory, $nodeDirectory)) {
+            if ($directory -notin ($machinePath -split ';')) {
+              $machinePath = "$directory;$machinePath"
+            }
+            $directory | Add-Content -Path $env:GITHUB_PATH -Encoding utf8
+          }
+          [Environment]::SetEnvironmentVariable('Path', $machinePath, 'Machine')
+          $env:Path = "$wranglerDirectory;$nodeDirectory;$env:Path"
+          & (Join-Path $wranglerDirectory 'wrangler.cmd') --version
+          if ($LASTEXITCODE -ne 0) { throw 'Cloudflare Wrangler version check failed.' }
+
+      - name: Install Visual Studio Code
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'vscode.zip'
+          $codeDirectory = Join-Path $env:ProgramFiles 'Microsoft VS Code'
+          $url = 'https://vscode.download.prss.microsoft.com/dbazure/download/stable/e646868227c3e3a9e3f24277c8c7220be42c0be7/VSCode-win32-x64-1.143.1.zip'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $expected = 'b4f9643b8a549ca2c85a1bbc9063fc76f1e08fc0036a7f6a1a181cdc05235eca'
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) {
+            throw 'VS Code archive checksum mismatch.'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $codeDirectory -Force
+          $codeBin = Join-Path $codeDirectory 'bin'
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($codeBin -notin ($machinePath -split ';')) {
+            [Environment]::SetEnvironmentVariable('Path', "$codeBin;$machinePath", 'Machine')
+          }
+          $codeBin | Add-Content -Path $env:GITHUB_PATH -Encoding utf8
+          $shortcutPath = Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'Visual Studio Code.lnk'
+          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
+          $shortcut.TargetPath = Join-Path $codeDirectory 'Code.exe'
+          $shortcut.WorkingDirectory = $env:GITHUB_WORKSPACE
+          $shortcut.Save()
+          & (Join-Path $codeBin 'code.cmd') --version
+          if ($LASTEXITCODE -ne 0) { throw 'VS Code version check failed.' }
+          $extensionsDirectory = Join-Path $env:USERPROFILE '.vscode\extensions'
+          & (Join-Path $codeBin 'code.cmd') --install-extension ms-vscode-remote.remote-ssh `
+            --extensions-dir $extensionsDirectory --force
+          if ($LASTEXITCODE -ne 0) { throw 'VS Code Remote - SSH installation failed.' }
+          $extensions = & (Join-Path $codeBin 'code.cmd') --list-extensions `
+            --extensions-dir $extensionsDirectory --show-versions
+          if ($LASTEXITCODE -ne 0 -or -not ($extensions -match '^ms-vscode-remote\.remote-ssh@')) {
+            throw 'VS Code Remote - SSH extension verification failed.'
+          }
+
       - name: Connect Tailscale
         uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf # v4
         timeout-minutes: 15
@@ -62,6 +149,80 @@ jobs:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           hostname: gh-rdp-${{ github.run_id }}-${{ github.run_attempt }}
           args: --shields-up=false
+
+      - name: Connect Docker CLI to Linux engine
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SERVER_ARTIFACT: docker-server-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+          $runApi = "$env:GITHUB_API_URL/repos/$env:GH_REPO/actions/runs/$env:GITHUB_RUN_ID"
+          $artifactId = $null
+          for ($attempt = 0; $attempt -lt 90; $attempt++) {
+            $artifacts = Invoke-RestMethod -Uri "$runApi/artifacts?per_page=100" -Headers $headers
+            $artifact = $artifacts.artifacts | Where-Object { $_.name -eq $env:SERVER_ARTIFACT -and -not $_.expired }
+            if ($artifact) { $artifactId = $artifact[0].id; break }
+            $jobs = Invoke-RestMethod -Uri "$runApi/jobs?filter=latest&per_page=100" -Headers $headers
+            $linuxJob = $jobs.jobs | Where-Object { $_.name -eq 'Linux Docker engine' }
+            if ($linuxJob -and $linuxJob.status -eq 'completed') {
+              throw 'Linux Docker job ended before becoming ready. Check its logs and use a reusable Tailscale Auth key.'
+            }
+            Start-Sleep -Seconds 10
+          }
+          if (-not $artifactId) { throw 'Timed out waiting for the Linux Docker engine.' }
+          $archive = Join-Path $env:RUNNER_TEMP 'docker-server.zip'
+          Invoke-WebRequest -Uri "$env:GITHUB_API_URL/repos/$env:GH_REPO/actions/artifacts/$artifactId/zip" `
+            -Headers $headers -OutFile $archive
+          $serverDirectory = Join-Path $env:RUNNER_TEMP 'docker-server'
+          Expand-Archive -LiteralPath $archive -DestinationPath $serverDirectory -Force
+          $server = Get-Content -LiteralPath (Join-Path $serverDirectory 'docker-server.json') -Raw | ConvertFrom-Json
+          $serverIp = [System.Net.IPAddress]::Parse($server.ip)
+          $bytes = $serverIp.GetAddressBytes()
+          if ($serverIp.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+              $bytes[0] -ne 100 -or $bytes[1] -lt 64 -or $bytes[1] -gt 127 -or
+              $server.user -notmatch '^[a-z_][a-z0-9_-]*$' -or
+              $server.hostKey -notmatch '^ssh-ed25519 [A-Za-z0-9+/=]+$') {
+            throw 'Invalid Linux Docker endpoint metadata.'
+          }
+          $sshDirectory = Join-Path $env:USERPROFILE '.ssh'
+          "github-docker $($server.hostKey)" |
+            Set-Content -LiteralPath (Join-Path $sshDirectory 'github-docker-known-hosts') -Encoding ascii
+          $sshConfig = @(
+            'Host github-docker',
+            "  HostName $serverIp",
+            "  User $($server.user)",
+            '  IdentityFile ~/.ssh/github-docker',
+            '  UserKnownHostsFile ~/.ssh/github-docker-known-hosts',
+            '  HostKeyAlias github-docker',
+            '  IdentitiesOnly yes',
+            '  StrictHostKeyChecking yes',
+            '  BatchMode yes',
+            '  ConnectTimeout 10'
+          )
+          $sshConfig | Add-Content -LiteralPath (Join-Path $sshDirectory 'config') -Encoding ascii
+          $connected = $false
+          for ($attempt = 0; $attempt -lt 12; $attempt++) {
+            & ssh.exe github-docker 'docker info --format {{.OSType}}'
+            if ($LASTEXITCODE -eq 0) { $connected = $true; break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $connected) { throw 'Cannot reach Linux Docker over SSH on the Tailscale network.' }
+          & docker.exe context create github-linux --docker 'host=ssh://github-docker'
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot create the Linux Docker context.' }
+          & docker.exe context use github-linux
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot activate the Linux Docker context.' }
+          & docker.exe version
+          if ($LASTEXITCODE -ne 0) { throw 'Docker client/server version check failed.' }
+          $dockerOs = & docker.exe info --format '{{.OSType}}'
+          if ($LASTEXITCODE -ne 0 -or $dockerOs.Trim() -ne 'linux') { throw 'Expected a Linux Docker engine.' }
+          & docker.exe compose version
+          if ($LASTEXITCODE -ne 0) { throw 'Docker Compose is unavailable.' }
+          & docker.exe run --rm hello-world
+          if ($LASTEXITCODE -ne 0) { throw 'Linux container smoke test failed.' }
+          "LINUX_DOCKER_IP=$serverIp" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
 
       - name: Configure RDP
         timeout-minutes: 5
@@ -119,6 +280,10 @@ jobs:
             '- Password: the value of your RDP_PASSWORD repository secret',
             "- Allowed client Tailscale IP: $env:RDP_CLIENT_IP",
             "- Project folder: $env:GITHUB_WORKSPACE",
+            '- Cloudflare Wrangler: 4.152.0 (run wrangler.cmd --version)',
+            '- VS Code: desktop shortcut or code.cmd .',
+            '- Remote - SSH: F1 > Remote-SSH: Connect to Host... > github-docker',
+            "- Linux Docker host: $env:LINUX_DOCKER_IP (context: github-linux)",
             '- Test duration: fixed at 4 hours (240 minutes)',
             "- Scheduled end (UTC): $($endsAt.ToString('u'))",
             '- Use Cancel workflow when testing is finished.',
@@ -144,3 +309,99 @@ jobs:
             -Name 'fDenyTSConnections' -Value 1
           Remove-NetFirewallRule -Name 'GitHub-RDP-Tailscale-Test' -ErrorAction SilentlyContinue
           # Tailscale's action post-step logs the ephemeral device out.
+
+  docker-linux:
+    name: Linux Docker engine
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Connect Tailscale
+        uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf # v4
+        timeout-minutes: 15
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: gh-docker-${{ github.run_id }}-${{ github.run_attempt }}
+          args: --shields-up=false
+
+      - name: Prepare Linux Docker and SSH
+        timeout-minutes: 30
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CLIENT_ARTIFACT: docker-client-${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo tailscale set --accept-routes=false
+          sudo systemctl start docker
+          sudo usermod -aG docker "$(id -un)"
+          sudo docker info --format '{{.OSType}}' | grep -x linux
+          run_api="repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID"
+          artifact_id=""
+          for attempt in $(seq 1 150); do
+            artifact_id="$(gh api "$run_api/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.name == \"$CLIENT_ARTIFACT\" and .expired == false) | .id")"
+            if [ -n "$artifact_id" ]; then break; fi
+            state="$(gh api "$run_api/jobs?filter=latest&per_page=100" \
+              --jq '.jobs[] | select(.name == "Windows RDP test") | .status')"
+            if [ "$state" = completed ]; then
+              echo 'Windows job ended before sharing its SSH public key.' >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          test -n "$artifact_id" || { echo 'Timed out waiting for Windows SSH public key.' >&2; exit 1; }
+          gh api "repos/$GH_REPO/actions/artifacts/$artifact_id/zip" > "$RUNNER_TEMP/docker-client.zip"
+          unzip -p "$RUNNER_TEMP/docker-client.zip" docker-client.pub | tr -d '\r' > "$RUNNER_TEMP/docker-client.pub"
+          ssh-keygen -l -f "$RUNNER_TEMP/docker-client.pub"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          cat "$RUNNER_TEMP/docker-client.pub" >> "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+          linux_ip="$(tailscale ip -4)"
+          sudo tee /etc/ssh/sshd_config.d/00-github-docker.conf > /dev/null <<EOF
+          ListenAddress $linux_ip
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          PermitRootLogin no
+          EOF
+          sudo ssh-keygen -A
+          sudo install -d -m 0755 /run/sshd
+          sudo /usr/sbin/sshd -t
+          # Ubuntu can use socket activation; restart with our Tailscale-only listener.
+          sudo systemctl disable --now ssh.socket || true
+          sudo systemctl restart ssh.service
+          host_key="$(awk '{print $1 " " $2}' /etc/ssh/ssh_host_ed25519_key.pub)"
+          jq -n --arg ip "$linux_ip" --arg user "$(id -un)" --arg hostKey "$host_key" \
+            '{ip: $ip, user: $user, hostKey: $hostKey}' > "$RUNNER_TEMP/docker-server.json"
+
+      - name: Share Linux endpoint and SSH host public key
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        timeout-minutes: 5
+        with:
+          name: docker-server-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/docker-server.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Keep Docker available until Windows testing finishes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          while true; do
+            state="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
+              --jq '.jobs[] | select(.name == "Windows RDP test") | .status')"
+            if [ "$state" = completed ]; then break; fi
+            sleep 30
+          done
+
+      - name: Stop Linux services
+        if: ${{ always() }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          sudo systemctl stop docker.service docker.socket ssh.service ssh.socket || true
